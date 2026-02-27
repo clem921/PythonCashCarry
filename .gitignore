@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+
+# Bases de données (générées localement)
+*.db
+
+# Logs et fichiers debug
+*.log
+debug_output.txt
+scraper_debug.txt
+
+# Fichiers temporaires de scraping
+sitemap.xml
+temp_sitemap.gz
+abn_page.html
+listing_page.html
+eurex_detail_test.json
+
+# Données CSV d'entrée (générées par les scripts)
+inputs/
+
+# Scripts de debug/test temporaires
+debug_sitemap.py
+extract_test.py
+verify_html.py
+verify_listing.py
+find_json.py
+probe_urls.py
+extract_links.py
