@@ -8,8 +8,6 @@ Utilise l'API native IBKR au lieu de ib_insync
 import sys
 import time
 import sqlite3
-import pandas as pd
-import numpy as np
 from datetime import datetime
 from threading import Thread, Event
 
@@ -21,8 +19,6 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.common import TickerId
-from ibapi.scanner import ScannerSubscription
-
 import config
 from universe_manager import UniverseDatabase
 
@@ -30,13 +26,7 @@ from universe_manager import UniverseDatabase
 IBKR_HOST = config.IBKR_CONFIG['host']
 IBKR_PORT = config.IBKR_CONFIG['port']
 IBKR_CLIENT_ID = config.IBKR_CONFIG['client_id']
-
-# Configuration pour les différents modes
-USE_REAL_TIME_DATA = not config.IBKR_CONFIG['paper_trading']
 ACCOUNT_ID = config.IBKR_CONFIG['account_id']
-DATA_MODE = "REALTIME" if USE_REAL_TIME_DATA else "DELAYED"
-
-TWS_PATH = config.IBKR_CONFIG['tws_path']
 
 # Configuration actuelle des marchés
 CURRENT_MARKET = 'EUROZONE'
@@ -54,7 +44,6 @@ class IBapi(EWrapper, EClient):
         self.market_data = {}
         self.contract_details = {}
         self.contract_details_end_events = {}  # Events pour synchroniser la réception des détails
-        self.scanner_data = {}
         self.next_order_id = None
         self.connected = False
         self.data_ready = False
@@ -104,17 +93,6 @@ class IBapi(EWrapper, EClient):
         # Signaler que la réception est terminée pour ce reqId
         if reqId in self.contract_details_end_events:
             self.contract_details_end_events[reqId].set()
-
-    def scannerData(self, reqId: int, rank: int, contractDetails, distance: str, benchmark: str, projection: str, legsStr: str):
-        super().scannerData(reqId, rank, contractDetails, distance, benchmark, projection, legsStr)
-        if reqId not in self.scanner_data:
-            self.scanner_data[reqId] = []
-        self.scanner_data[reqId].append(contractDetails)
-        print(f"Scanner Data: {rank} - {contractDetails.contract.symbol}")
-    
-    def scannerDataEnd(self, reqId: int):
-        super().scannerDataEnd(reqId)
-        print(f"Scanner Data End: {reqId}")
 
     def error(self, reqId: TickerId, errorCode: int, errorString: str, advancedOrderRejectJson: str = ""):
         # Messages purement informatifs (connexion data farm ok, etc.)
@@ -176,6 +154,7 @@ class CashCarryTrader:
         self.ib = IBapi()
         self.connected = False
         self.positions = {}
+        self.account_info = {}  # Métriques du compte (cash, marge, etc.)
         self.init_database()
 
         # Démarrer le thread pour l'API IBKR
@@ -372,13 +351,11 @@ class CashCarryTrader:
                     # Note: fetch_available_futures() est appelé dans find_cash_carry_opportunities()
                     # avec les bons assets et métadonnées (primary_exchange, derivatives_exchange)
 
-                    # Attendre un peu pour recevoir les données du compte
-                    time.sleep(2)
+                    # Attendre la réception des données du compte
+                    time.sleep(3)
 
-                    # Afficher le solde
-                    net_liquidation = self.ib.account_values.get('NetLiquidation', {})
-                    print(f"Compte: {ACCOUNT_ID}")
-                    print(f"Solde: {net_liquidation.get('value', 'N/A')}")
+                    # Récupérer et afficher les métriques du compte
+                    self._load_account_info()
                     return True
                 time.sleep(1)
 
@@ -389,50 +366,115 @@ class CashCarryTrader:
             print(f"Erreur de connexion à IBKR: {e}")
             return False
 
-    def run_market_scanner(self):
-        """Exécuter le scanner pour trouver des actifs potentiels"""
-        print(f"Lancement du scanner de marché pour {CURRENT_MARKET}...")
+    def _get_account_value(self, key, as_float=True):
+        """Lire une valeur du compte IBKR (retourne float ou str)"""
+        entry = self.ib.account_values.get(key, {})
+        val = entry.get('value', None)
+        if val is None:
+            return 0.0 if as_float else 'N/A'
+        if as_float:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return 0.0
+        return val
+
+    def _load_account_info(self):
+        """Charger les métriques du compte et calculer la capacité de position.
         
-        scan_sub = ScannerSubscription()
-        scan_sub.instrument = config.SCANNER_CONFIG['instrument']
-        scan_sub.scanCode = config.SCANNER_CONFIG['scanCode']
-        scan_sub.numberOfRows = config.SCANNER_CONFIG['numberOfRows']
+        Clés IBKR utilisées :
+          - NetLiquidation     : valeur liquidative nette du portefeuille
+          - AvailableFunds     : fonds disponibles pour de nouvelles positions
+          - BuyingPower        : pouvoir d'achat (effet de levier inclus)
+          - TotalCashValue     : cash disponible
+          - InitMarginReq      : marge initiale déjà utilisée
+          - MaintMarginReq     : marge de maintenance utilisée
+          - ExcessLiquidity    : excédent de liquidité (buffer avant appel de marge)
+        """
+        net_liq = self._get_account_value('NetLiquidation')
+        available_funds = self._get_account_value('AvailableFunds')
+        buying_power = self._get_account_value('BuyingPower')
+        total_cash = self._get_account_value('TotalCashValue')
+        init_margin = self._get_account_value('InitMarginReq')
+        maint_margin = self._get_account_value('MaintMarginReq')
+        excess_liq = self._get_account_value('ExcessLiquidity')
+        currency = self.ib.account_values.get('NetLiquidation', {}).get('currency', 'EUR')
+
+        self.account_info = {
+            'net_liquidation': net_liq,
+            'available_funds': available_funds,
+            'buying_power': buying_power,
+            'total_cash': total_cash,
+            'init_margin_req': init_margin,
+            'maint_margin_req': maint_margin,
+            'excess_liquidity': excess_liq,
+            'currency': currency,
+        }
+
+        print(f"\n{'='*80}")
+        print(f"  COMPTE {ACCOUNT_ID} — {currency}")
+        print(f"{'='*80}")
+        print(f"  Valeur liquidative  : {net_liq:>12,.2f} {currency}")
+        print(f"  Cash disponible     : {total_cash:>12,.2f} {currency}")
+        print(f"  Fonds disponibles   : {available_funds:>12,.2f} {currency}")
+        print(f"  Pouvoir d'achat     : {buying_power:>12,.2f} {currency}")
+        print(f"  Marge initiale util.: {init_margin:>12,.2f} {currency}")
+        print(f"  Marge maint. util.  : {maint_margin:>12,.2f} {currency}")
+        print(f"  Excédent liquidité  : {excess_liq:>12,.2f} {currency}")
+        print(f"{'='*80}\n")
+
+    def get_max_position_size(self, stock_price, future_margin_pct=0.15):
+        """Calculer la taille de position maximale pour un spread action + future.
         
-        # Définir la location code
-        loc_codes = config.SCANNER_CONFIG['locationCode']
-        if CURRENT_MARKET in loc_codes:
-            scan_sub.locationCode = loc_codes[CURRENT_MARKET]
+        La position nécessite :
+          - Cash/fonds pour acheter les actions (ou marge action ~50% en Reg-T)
+          - Marge initiale pour le contrat future vendu (~15% du notionnel)
+        
+        On prend le minimum entre :
+          1. La limite de config (max_position_size)
+          2. Le nominal max supporté par les fonds disponibles
+        
+        Args:
+            stock_price: Prix de l'action
+            future_margin_pct: Taux de marge initiale estimé pour le future (défaut 15%)
+        
+        Returns:
+            dict avec nominal_max, qty_max, limiting_factor
+        """
+        available = self.account_info.get('available_funds', 0)
+        
+        if available <= 0 or stock_price <= 0:
+            return {'nominal_max': 0, 'qty_max': 0, 'limiting_factor': 'Pas de fonds disponibles'}
+
+        # Coût en capital par action dans le spread :
+        #   - Action : 100% du prix (achat cash) ou ~50% en marge (Reg-T)
+        #   - Future : marge initiale (~15% du notionnel par contrat)
+        # En conservatif on prend 100% pour l'action + marge future
+        capital_per_share = stock_price * (1.0 + future_margin_pct)
+        
+        # Nominal max depuis les fonds disponibles
+        nominal_from_account = available / (1.0 + future_margin_pct) 
+        
+        # Limite de config
+        config_limit = config.DIVIDEND_CAPTURE_CONFIG.get('max_position_size',
+                       config.STRATEGY_CONFIG.get('max_position_size', 10000))
+        
+        nominal_max = min(nominal_from_account, config_limit)
+        qty_max = int(nominal_max / stock_price) if stock_price > 0 else 0
+        
+        if nominal_from_account <= config_limit:
+            limiting_factor = f"Fonds disponibles ({available:,.2f})"
         else:
-            scan_sub.locationCode = 'STK.US.MAJOR' # Fallback
-            
-        req_id = 9001
-        self.ib.scanner_data[req_id] = [] # Reset previous data
+            limiting_factor = f"Limite config ({config_limit:,.2f})"
         
-        self.ib.reqScannerSubscription(req_id, scan_sub, [], [])
-        
-        # Attendre les résultats
-        print("Attente des résultats du scanner (5s)...")
-        time.sleep(5)
-        
-        # Annuler la souscription pour éviter les mises à jour continues
-        self.ib.cancelScannerSubscription(req_id)
-        
-        results = self.ib.scanner_data.get(req_id, [])
-        print(f"Scanner terminé : {len(results)} actifs trouvés.")
-        
-        assets = []
-        for item in results:
-            # On suppose par défaut que le symbole du future est le même que l'action 
-            # (vrai pour les SSF, faux pour les indices mais le scanner STK retourne des actions)
-            symbol = item.contract.symbol
-            assets.append({
-                'symbol': symbol,
-                'future_symbol': symbol, # Pour les SSF, c'est souvent le même ticker
-                'name': f"{symbol} Stock"
-            })
-            
-        return assets
-    
+        return {
+            'nominal_max': nominal_max,
+            'qty_max': qty_max,
+            'limiting_factor': limiting_factor,
+            'available_funds': available,
+            'capital_per_share': capital_per_share,
+        }
+
     def _request_contract_details(self, contract, timeout=10):
         """Demander les détails d'un contrat et ATTENDRE la réponse complète (contractDetailsEnd).
         Retourne la liste des ContractDetails reçus, ou [] si timeout/erreur."""
@@ -488,9 +530,10 @@ class CashCarryTrader:
         if not hasattr(self, 'available_futures'):
             self.available_futures = {}
 
-        # Construire une map dédupliquée : future_symbol -> métadonnées de l'actif
-        # On garde la première occurrence pour chaque future_symbol
-        futures_to_fetch = {}
+        # Construire une map dédupliquée par sous-jacent pour éviter les lookups
+        # redondants (ex: AS6 et AS7 ont le même sous-jacent ASML)
+        # underlying_key -> (asset_info, [future_symbol_1, future_symbol_2, ...])
+        underlying_to_fetch = {}
         for asset in assets:
             # Ignorer les indices (pas de SSF, flow différent)
             if asset.get('asset_type') == 'INDEX':
@@ -498,11 +541,19 @@ class CashCarryTrader:
                 continue
             
             fs = asset['future_symbol']
-            if fs and fs not in futures_to_fetch:
-                futures_to_fetch[fs] = asset
+            if not fs:
+                continue
+            stock_sym = asset['symbol']
+            deriv_exch = asset.get('derivatives_exchange', '')
+            key = (stock_sym, deriv_exch)
+            
+            if key not in underlying_to_fetch:
+                underlying_to_fetch[key] = (asset, [fs])
+            else:
+                # Même sous-jacent, ajouter ce future_symbol à la liste
+                underlying_to_fetch[key][1].append(fs)
 
-        for future_symbol, asset in futures_to_fetch.items():
-            stock_symbol = asset['symbol']
+        for (stock_symbol, _), (asset, future_symbols) in underlying_to_fetch.items():
             primary_exchange = asset.get('primary_exchange', '')
             derivatives_exchange = asset.get('derivatives_exchange', '')
             
@@ -521,6 +572,8 @@ class CashCarryTrader:
                     continue
                 
                 # ─── Étape 2 : Rechercher les futures SSF avec échange dérivés explicite ───
+                # IBKR attend le symbole du sous-jacent (ex: 'ASML'), pas le code Euronext (ex: 'AS6')
+                ibkr_future_symbol = stock_symbol
                 # Table de fallback : si l'échange principal ne retourne rien, essayer les alternatives
                 # Priorité : FTA (Euronext Derivatives unifié, confirmé fonctionnel) puis DTB (Eurex)
                 FALLBACK_EXCHANGES = {
@@ -528,6 +581,13 @@ class CashCarryTrader:
                     'LSSF': ['FTA', 'DTB'],          # LSSF → FTA → Eurex
                     'DTB': ['FTA', 'LSSF'],          # Eurex → FTA → LSSF
                     'MONEP': ['FTA', 'LSSF', 'DTB'], # MONEP → FTA → LSSF → Eurex
+                    # Codes Euronext API → mapper vers FTA/LSSF (codes IBKR)
+                    'DPAR': ['FTA', 'LSSF', 'DTB'],  # Euronext Paris Derivatives
+                    'DAMS': ['FTA', 'LSSF', 'DTB'],  # Euronext Amsterdam Derivatives
+                    'DMIL': ['FTA', 'LSSF', 'DTB'],  # Euronext Milan Derivatives
+                    'DBRU': ['FTA', 'LSSF', 'DTB'],  # Euronext Brussels Derivatives
+                    'DLIS': ['FTA', 'LSSF', 'DTB'],  # Euronext Lisbon Derivatives
+                    'DOSL': ['FTA', 'LSSF', 'DTB'],  # Euronext Oslo Derivatives
                 }
                 
                 # Construire la liste d'exchanges à tenter : principal + fallbacks
@@ -540,20 +600,20 @@ class CashCarryTrader:
                 
                 for try_exchange in exchanges_to_try:
                     future_contract = self.create_future_contract(
-                        future_symbol, 
+                        ibkr_future_symbol, 
                         derivatives_exchange=try_exchange
                     )
-                    print(f"  [{stock_symbol}] Recherche SSF '{future_symbol}' sur {future_contract.exchange}...")
+                    print(f"  [{stock_symbol}] Recherche SSF '{ibkr_future_symbol}' sur {future_contract.exchange}...")
                     
                     future_details_list = self._request_contract_details(future_contract, timeout=10)
                     
                     if future_details_list:
                         used_exchange = try_exchange
                         if try_exchange != exchanges_to_try[0]:
-                            print(f"  [{stock_symbol}] ✓ Trouvé via fallback sur {try_exchange} (primaire {exchanges_to_try[0]} sans résultat)")
+                            print(f"  [{stock_symbol}] Trouve via fallback sur {try_exchange} (primaire {exchanges_to_try[0]} sans resultat)")
                         break
                     else:
-                        print(f"  [{stock_symbol}] Aucun contrat future trouvé pour '{future_symbol}' sur {try_exchange}")
+                        print(f"  [{stock_symbol}] Aucun contrat future trouve pour '{ibkr_future_symbol}' sur {try_exchange}")
                 
                 if not future_details_list:
                     print(f"  [{stock_symbol}] Aucun SSF trouvé sur aucun exchange ({', '.join(exchanges_to_try)})")
@@ -587,18 +647,20 @@ class CashCarryTrader:
                     
                     valid_contracts.append(fc)
                 
-                # ─── Étape 4 : Stocker les contrats valides ───
+                # ─── Étape 4 : Stocker les contrats valides sous tous les future_symbols ───
                 if valid_contracts:
-                    self.available_futures[future_symbol] = sorted(
+                    sorted_contracts = sorted(
                         valid_contracts, 
                         key=lambda c: c.lastTradeDateOrContractMonth
                     )
-                    print(f"  [{stock_symbol}] ✓ {len(valid_contracts)} SSF valide(s) :")
+                    for fs in future_symbols:
+                        self.available_futures[fs] = sorted_contracts
+                    print(f"  [{stock_symbol}] OK {len(valid_contracts)} SSF valide(s) (stocke pour {', '.join(future_symbols)}) :")
                     for c in valid_contracts:
                         print(f"    - {c.lastTradeDateOrContractMonth}: {c.localSymbol} "
                               f"(Mult={c.multiplier}, ConId={c.conId}, Exchange={c.exchange})")
                 else:
-                    print(f"  [{stock_symbol}] ✗ Aucun SSF valide après filtrage")
+                    print(f"  [{stock_symbol}] ECHEC Aucun SSF valide apres filtrage")
 
             except Exception as e:
                 print(f"  [{stock_symbol}] Erreur lors de la récupération: {e}")
@@ -610,15 +672,28 @@ class CashCarryTrader:
             self.connected = False
             print("Déconnecté de IBKR TWS")
 
-    def create_stock_contract(self, symbol, primary_exchange=''):
-        """Créer un contrat d'action avec primaryExchange pour désambiguïser le conId"""
+    def create_stock_contract(self, symbol, primary_exchange='', currency=''):
+        """Créer un contrat d'action avec primaryExchange pour désambiguïser le conId.
+        
+        Args:
+            symbol: Symbole de l'action (ex: 'ASML', 'ULVR')
+            primary_exchange: Exchange primaire IBKR (ex: 'AEB', 'LSE')
+            currency: Devise du contrat. Si vide, déduit de primary_exchange
+                      via EXCHANGE_CURRENCY, sinon devise du marché courant.
+        """
         market_config = config.MARKETS[CURRENT_MARKET]
         
         contract = Contract()
         contract.symbol = symbol
         contract.secType = 'STK'
         contract.exchange = 'SMART'
-        contract.currency = market_config['currency']
+        # Devise : paramètre explicite > déduite de l'exchange > devise du marché
+        if currency:
+            contract.currency = currency
+        elif primary_exchange and primary_exchange in config.EXCHANGE_CURRENCY:
+            contract.currency = config.EXCHANGE_CURRENCY[primary_exchange]
+        else:
+            contract.currency = market_config['currency']
         # primaryExchange est CRITIQUE pour les actions européennes :
         # Sans lui, IBKR peut résoudre vers le mauvais listing (mauvais conId)
         if primary_exchange:
@@ -651,54 +726,68 @@ class CashCarryTrader:
     def get_market_price(self, contract, req_id):
         """Récupérer le prix de marché pour un contrat (Snapshot: Bid/Ask/Last)"""
         # Demander les données de marché (Snapshot = True pour éviter flux continu)
-        # Snapshot=True est mieux pour éviter de saturer, mais parfois lent.
-        # Ici on utilise le snapshot pour éviter l'erreur de limite de lignes de données (max 100)
         self.ib.reqMktData(req_id, contract, '', True, False, [])
 
-        # Attendre la réception des données (Polling avec timeout)
-        # On attend jusqu'à 4 secondes max, mais on sort dès qu'on a des données significatives
-        # 4 = Last, 66 = DelayedLast, 1 = Bid, 67 = DelayedBid, 2 = Ask, 68 = DelayedAsk, 9 = Close, 75 = DelayedClose
-        significant_ticks = [4, 66, 1, 67, 2, 68, 9, 75] 
-        
-        for _ in range(20): # 20 * 0.2s = 4 secondes max
+        # Tick IDs: 1=Bid, 2=Ask, 4=Last, 9=Close
+        #           67=DelayedBid, 68=DelayedAsk, 66=DelayedLast, 75=DelayedClose
+        bid_ticks = [1, 67]
+        ask_ticks = [2, 68]
+        fallback_ticks = [4, 66, 9, 75]  # Last, Close (temps réel + différé)
+
+        # Phase 1 : Attendre Bid ET Ask (jusqu'à 4 secondes)
+        got_bid_ask = False
+        for _ in range(20):  # 20 * 0.2s = 4 secondes
             if req_id in self.ib.market_data:
                 data = self.ib.market_data[req_id]
-                # Vérifier si on a au moins une donnée utile
-                if any(t in data for t in significant_ticks):
+                has_bid = any(t in data for t in bid_ticks)
+                has_ask = any(t in data for t in ask_ticks)
+                if has_bid and has_ask:
+                    got_bid_ask = True
                     break
             time.sleep(0.2)
-        
+
+        # Phase 2 : Si pas de Bid/Ask, attendre encore 2s pour un fallback (Last/Close)
+        if not got_bid_ask:
+            for _ in range(10):  # 10 * 0.2s = 2 secondes
+                if req_id in self.ib.market_data:
+                    data = self.ib.market_data[req_id]
+                    if any(t in data for t in bid_ticks + ask_ticks + fallback_ticks):
+                        break
+                time.sleep(0.2)
+
         # Récupérer les prix
         price_data = {'last': None, 'bid': None, 'ask': None}
 
         if req_id in self.ib.market_data:
             data = self.ib.market_data[req_id]
-            
-            # 1. Essayer LAST (Temps réel ou Différé)
+
+            # Bid/Ask (temps réel ou différé)
+            raw_bid = data.get(1) or data.get(67)
+            raw_ask = data.get(2) or data.get(68)
+
+            # Filtrer les prix invalides (-1 = non disponible chez IBKR)
+            if raw_bid and raw_bid > 0:
+                price_data['bid'] = raw_bid
+            if raw_ask and raw_ask > 0:
+                price_data['ask'] = raw_ask
+
+            # Last (temps réel ou différé)
             price_data['last'] = data.get(4) or data.get(66)
-            
-            # 2. Essayer BID/ASK (Temps réel ou Différé)
-            price_data['bid'] = data.get(1) or data.get(67)
-            price_data['ask'] = data.get(2) or data.get(68)
-            
-            # 3. Si pas de LAST, essayer de construire un prix médian BID/ASK
+
+            # Si pas de Last, construire un mid à partir de Bid/Ask
             if not price_data['last'] and price_data['bid'] and price_data['ask']:
                 price_data['last'] = (price_data['bid'] + price_data['ask']) / 2
-                
-            # 4. Si toujours rien, essayer CLOSE (Temps réel ou Différé)
+
+            # Dernier recours : Close
             if not price_data['last']:
                 price_data['last'] = data.get(9) or data.get(75)
 
-            # Debug si toujours rien
-            if not price_data['last']:
-                 print(f"    [DEBUG] Pas de prix trouvé pour {contract.symbol}. Ticks reçus: {list(data.keys())}")
+            # Debug
+            if not price_data['last'] and not price_data['bid']:
+                print(f"    [DEBUG] Pas de prix trouvé pour {contract.symbol}. Ticks reçus: {list(data.keys())}")
         else:
-             print(f"    [DEBUG] Aucune donnée reçue pour {contract.symbol} (reqId {req_id})")
+            print(f"    [DEBUG] Aucune donnée reçue pour {contract.symbol} (reqId {req_id})")
 
-        # NOTE: Avec snapshot=True, IBKR ferme automatiquement la souscription une fois les données envoyées.
-        # Appeler cancelMktData ici provoque l'erreur 300 "Can't find EId" car la reqId n'existe plus.
-        # On ne l'appelle donc pas.
-            
         return price_data
 
     def find_cash_carry_opportunities(self, use_scanner=False):
@@ -1065,19 +1154,472 @@ class CashCarryTrader:
             print(f"Erreur: Région de marché invalide ou désactivée '{market_region}'.")
             return False
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATÉGIE 2 : DIVIDEND CAPTURE (Achat action + Vente future le jour ex-dividende)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def find_dividend_capture_opportunities(self, target_date=None):
+        """Trouver des opportunités de Dividend Capture.
+        
+        Stratégie : Le jour de la date ex-dividende, acheter l'action et vendre
+        le future correspondant pour le même nominal, puis dénouer le lendemain.
+        
+        Args:
+            target_date: Date cible YYYY-MM-DD (défaut: aujourd'hui)
+        
+        Returns:
+            Liste d'opportunités triées par rentabilité décroissante
+        """
+        if not self.connected:
+            print("Non connecté à IBKR")
+            return []
+
+        db = UniverseDatabase()
+        currency_filter = config.MARKETS[CURRENT_MARKET]['currency']
+        
+        # Récupérer les actifs dont c'est la date ex-dividende
+        exdiv_assets = db.get_exdividend_today(
+            region_currency=currency_filter,
+            target_date=target_date
+        )
+        
+        if not exdiv_assets:
+            date_str = target_date or datetime.now().strftime('%Y-%m-%d')
+            print(f"\nAucun actif avec date ex-dividende le {date_str} (devise: {currency_filter})")
+            print("Lancez d'abord: python update_dividends.py")
+            return []
+        
+        print(f"\n{'='*80}")
+        print(f"  DIVIDEND CAPTURE — {len(exdiv_assets)} actif(s) ex-dividende le {target_date or datetime.now().strftime('%Y-%m-%d')}")
+        print(f"{'='*80}")
+        
+        # Construire la liste pour fetch_available_futures
+        assets_for_futures = []
+        exdiv_map = {}  # future_symbol -> dividend info
+        
+        for asset in exdiv_assets:
+            underlying = asset['underlying_symbol'] or asset['symbol']
+            future_sym = asset['future_symbol'] or asset['symbol']
+            
+            if not underlying or not future_sym:
+                print(f"  [{asset['symbol']}] IGNORÉ — pas de sous-jacent ou de future")
+                continue
+            
+            assets_for_futures.append({
+                'symbol': underlying,
+                'future_symbol': future_sym,
+                'name': f"{underlying} (div={asset['dividend_amount']:.4f})",
+                'primary_exchange': asset.get('underlying_primary_exchange', '') or asset.get('primary_exchange', ''),
+                'derivatives_exchange': asset['derivatives_exchange'],
+            })
+            exdiv_map[future_sym] = asset
+        
+        if not assets_for_futures:
+            print("  Aucun actif exploitable trouvé")
+            return []
+        
+        # Récupérer les contrats futures disponibles sur IBKR
+        self.fetch_available_futures(assets_override=assets_for_futures)
+        
+        opportunities = []
+        div_config = config.DIVIDEND_CAPTURE_CONFIG
+        
+        for asset in assets_for_futures:
+            stock_symbol = asset['symbol']
+            future_symbol = asset['future_symbol']
+            primary_exchange = asset.get('primary_exchange', '')
+            derivatives_exchange = asset.get('derivatives_exchange', '')
+            div_info = exdiv_map.get(future_symbol, {})
+            dividend_amount = div_info.get('dividend_amount', 0)
+            
+            try:
+                # Vérifier futures disponibles
+                if not hasattr(self, 'available_futures') or future_symbol not in self.available_futures:
+                    print(f"\n  [{stock_symbol}] Aucun contrat futur trouvé ({future_symbol})")
+                    continue
+                
+                futures_list = self.available_futures[future_symbol]
+                if not futures_list:
+                    print(f"\n  [{stock_symbol}] Liste de futures vide")
+                    continue
+                
+                # Créer contrat action
+                stock_contract = self.create_stock_contract(stock_symbol, primary_exchange=primary_exchange)
+                
+                # Prix de l'action — Bid ET Ask requis pour évaluer la rentabilité
+                req_id_stock = self.ib.get_next_req_id()
+                stock_data = self.get_market_price(stock_contract, req_id_stock)
+                
+                stock_ask = stock_data['ask']
+                stock_bid = stock_data['bid']
+                stock_last = stock_data['last']
+                
+                if not stock_bid or not stock_ask:
+                    print(f"\n  [{stock_symbol}] Bid/Ask action incomplet (Bid={stock_bid}, Ask={stock_ask}, Last={stock_last}) — ignoré")
+                    continue
+                
+                # Capacité de position pour ce prix
+                pos_size = self.get_max_position_size(stock_ask)
+
+                print(f"\n{'-'*80}")
+                print(f"  {stock_symbol} - Dividende: {dividend_amount:.4f} - Prix Action: Bid={stock_bid:.2f}  Ask={stock_ask:.2f}  Last={stock_last}  Spread={stock_ask-stock_bid:.2f}")
+                print(f"  Position max: {pos_size['qty_max']} actions ({pos_size['nominal_max']:,.2f} {self.account_info.get('currency','EUR')}) - {pos_size['limiting_factor']}")
+                print(f"{'-'*80}")
+                
+                # Évaluer chaque maturité de future, garder la meilleure
+                best_opp = None
+                
+                for future_contract in futures_list:
+                    expiry = future_contract.lastTradeDateOrContractMonth
+                    
+                    # Vérifier l'expiration max
+                    try:
+                        expiry_date = datetime.strptime(expiry, "%Y%m%d")
+                        days_to_expiry = (expiry_date - datetime.now()).days
+                        if days_to_expiry > div_config['max_future_expiry_days']:
+                            print(f"  Maturite {expiry}: Trop eloignee ({days_to_expiry}j > {div_config['max_future_expiry_days']}j)")
+                            continue
+                    except (ValueError, TypeError):
+                        days_to_expiry = 999
+                    
+                    # Multiplicateur
+                    multiplier = 1
+                    if future_contract.multiplier:
+                        try:
+                            multiplier = int(float(future_contract.multiplier))
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    stock_qty = multiplier
+                    future_qty = 1
+                    
+                    # Prix du future — Bid ET Ask requis
+                    req_id_future = self.ib.get_next_req_id()
+                    future_data = self.get_market_price(future_contract, req_id_future)
+                    
+                    future_bid = future_data['bid']
+                    future_ask = future_data['ask']
+                    future_last = future_data['last']
+                    
+                    if not future_bid or not future_ask:
+                        print(f"  Maturite {expiry}: Bid/Ask future incomplet (Bid={future_bid}, Ask={future_ask}, Last={future_last})")
+                        continue
+                    
+                    # Prix exécutables :
+                    #   Ouverture : achat action au Ask, vente future au Bid
+                    #   Clôture J+1 : vente action au Bid, rachat future au Ask
+                    exec_stock_price = stock_ask
+                    exec_future_price = future_bid
+                    
+                    # Sanity check prix
+                    price_diff_pct = abs(exec_future_price - exec_stock_price) / exec_stock_price
+                    if price_diff_pct > 0.20:
+                        print(f"  Maturite {expiry}: Prix incoherent (ecart {price_diff_pct*100:.1f}%). Ignore.")
+                        continue
+                    
+                    # Calculer les coûts pour 1 jour de portage (avec spread réel bid/ask)
+                    cost_detail = self.calculate_dividend_capture_cost(
+                        stock_price=exec_stock_price,
+                        stock_qty=stock_qty,
+                        future_qty=future_qty,
+                        stock_contract=stock_contract,
+                        future_contract=future_contract,
+                        derivatives_exchange=derivatives_exchange,
+                        dividend_amount=dividend_amount,
+                        stock_bid=stock_bid,
+                        stock_ask=stock_ask,
+                        future_bid=future_bid,
+                        future_ask=future_ask,
+                    )
+                    
+                    total_cost = cost_detail['total_cost']
+                    dividend_revenue = cost_detail['dividend_revenue']
+                    profit_net = dividend_revenue - total_cost
+                    profit_net_pct = (profit_net / exec_stock_price) * 100 if exec_stock_price else 0
+                    is_opportunity = profit_net_pct >= div_config['min_profit_pct']
+                    
+                    print(f"  Maturite {expiry} ({future_contract.localSymbol}, Mult={multiplier}, {days_to_expiry}j):")
+                    print(f"    Action (achat) : {exec_stock_price:>10.2f}  (Bid={stock_bid}  Ask={stock_ask})")
+                    print(f"    Future (vente) : {exec_future_price:>10.2f}  (Bid={future_bid}  Ask={future_ask})")
+                    print(f"    Dividende      : {dividend_amount:>10.4f}  /action")
+                    print(f"    --- Couts (portage 1 jour) ---")
+                    print(f"    Financement    : {cost_detail['funding_cost']:>10.4f}")
+                    print(f"    Commissions    : {cost_detail['commission_per_share']:>10.4f}  (total={cost_detail['commission_total']:.2f}, {cost_detail['commission_source']})")
+                    print(f"    Spread bid/ask : {cost_detail['spread_cost_per_share']:>10.4f}  ({cost_detail['spread_source']})")
+                    print(f"    TTF/taxes      : {cost_detail['ftt_per_share']:>10.4f}")
+                    print(f"    Cout total     : {total_cost:>10.4f}")
+                    print(f"    Revenu dividende: {dividend_revenue:>+10.4f}")
+                    print(f"    Profit net est.: {profit_net:>+10.4f}  ({profit_net_pct:>+.4f}%)")
+                    print(f"    Rentabilite    : {'>>> OPPORTUNITE <<<' if is_opportunity else 'Insuffisante'}")
+                    
+                    if is_opportunity:
+                        opp = {
+                            'stock': stock_symbol,
+                            'stock_price': exec_stock_price,
+                            'future': future_symbol,
+                            'future_price': exec_future_price,
+                            'expiry': expiry,
+                            'days_to_expiry': days_to_expiry,
+                            'dividend_amount': dividend_amount,
+                            'dividend_revenue': dividend_revenue,
+                            'total_cost': total_cost,
+                            'profit_net': profit_net,
+                            'profit_net_pct': profit_net_pct,
+                            'stock_contract': stock_contract,
+                            'future_contract': future_contract,
+                            'cost_detail': cost_detail,
+                            'multiplier': multiplier,
+                        }
+                        if best_opp is None or opp['profit_net'] > best_opp['profit_net']:
+                            best_opp = opp
+                
+                if best_opp:
+                    opportunities.append(best_opp)
+                    
+            except Exception as e:
+                print(f"\n  [{stock_symbol}] Erreur: {e}")
+        
+        # Résumé final
+        print(f"\n{'='*80}")
+        print(f"  RÉSUMÉ DIVIDEND CAPTURE : {len(opportunities)} opportunité(s) sur {len(assets_for_futures)} actifs analysés")
+        print(f"{'='*80}")
+        if opportunities:
+            opportunities.sort(key=lambda x: x['profit_net_pct'], reverse=True)
+            for opp in opportunities:
+                print(f"  {opp['stock']:>6s}  Div={opp['dividend_amount']:.4f}  Action={opp['stock_price']:.2f}  "
+                      f"Future={opp['future_price']:.2f}  Profit={opp['profit_net']:+.4f} ({opp['profit_net_pct']:+.4f}%)  "
+                      f"Exp={opp['expiry']}")
+        else:
+            print("  Aucune opportunité détectée.")
+        print(f"{'='*80}\n")
+        
+        return opportunities
+
+    def calculate_dividend_capture_cost(self, stock_price, stock_qty, future_qty,
+                                         stock_contract, future_contract,
+                                         derivatives_exchange='', dividend_amount=0,
+                                         stock_bid=None, stock_ask=None,
+                                         future_bid=None, future_ask=None):
+        """Calculer le coût pour un Dividend Capture (portage 1 jour).
+        
+        Utilise les spreads bid/ask réels pour le coût de traversée :
+          Ouverture : achat action au Ask + vente future au Bid
+          Clôture   : vente action au Bid + rachat future au Ask
+        
+        Returns:
+            dict avec le détail des coûts et le revenu du dividende
+        """
+        costs = config.COST_CONFIG
+        
+        # 1 jour de portage
+        T = 1.0 / 365.0
+        
+        # Financement
+        funding_rate = self.ib.get_funding_rate()
+        funding_cost = stock_price * funding_rate * T
+        
+        # Commissions (4 jambes: achat+vente action, vente+achat future)
+        comm = self.estimate_spread_commissions(
+            stock_contract, future_contract, stock_qty, future_qty
+        )
+        commission_per_share = comm['total'] / stock_qty if stock_qty > 0 else 0
+        
+        # Coût de traversée du spread (bid/ask réel si disponible, sinon estimation)
+        if stock_bid and stock_ask and future_bid and future_ask:
+            # Spread réel action : on traverse 2 fois (achat au Ask, vente au Bid)
+            stock_spread_cost = stock_ask - stock_bid
+            # Spread réel future : on traverse 2 fois (vente au Bid, rachat au Ask)
+            future_spread_cost = future_ask - future_bid
+            spread_cost_per_share = stock_spread_cost + future_spread_cost
+            spread_source = "bid/ask réel"
+        else:
+            # Fallback estimation statique (4 traversées)
+            spread_cost_per_share = stock_price * (costs['slippage_bps'] / 10000) * 4
+            spread_source = "estimation"
+        
+        # Taxes sur transactions financières
+        ftt_per_share = 0.0
+        if derivatives_exchange in ('DPAR', 'FTA') or (hasattr(stock_contract, 'primaryExchange') and stock_contract.primaryExchange == 'SBF'):
+            ftt_per_share = stock_price * costs['ftt_rate_fr']
+        elif derivatives_exchange in ('DMIL',):
+            ftt_per_share = stock_price * costs['ftt_rate_it']
+        
+        # Coût total par action
+        total_cost = funding_cost + commission_per_share + spread_cost_per_share + ftt_per_share
+        
+        # Revenu dividende par action
+        dividend_revenue = dividend_amount
+        
+        return {
+            'T': T,
+            'funding_rate': funding_rate,
+            'funding_cost': funding_cost,
+            'commission_total': comm['total'],
+            'commission_per_share': commission_per_share,
+            'commission_source': comm['source'],
+            'spread_cost_per_share': spread_cost_per_share,
+            'spread_source': spread_source,
+            'ftt_per_share': ftt_per_share,
+            'total_cost': total_cost,
+            'total_cost_pct': (total_cost / stock_price) * 100 if stock_price else 0,
+            'dividend_revenue': dividend_revenue,
+        }
+
+    def run_dividend_capture_session(self, target_date=None):
+        """Exécuter une session Dividend Capture (ouverture des positions)"""
+        try:
+            if not self.connect_to_ibkr():
+                return
+
+            opportunities = self.find_dividend_capture_opportunities(target_date=target_date)
+
+            if opportunities:
+                max_trades = getattr(config, 'MAX_TRADES_PER_SESSION', 1)
+                best_opportunities = opportunities[:max_trades]
+
+                print(f"\n{'='*80}")
+                print(f"  SÉLECTION DES {len(best_opportunities)} MEILLEURE(S) OPPORTUNITÉ(S) DIVIDEND CAPTURE")
+                print(f"{'='*80}")
+
+                for opp in best_opportunities:
+                    print(f"\n>>> CANDIDAT : {opp['stock']} (dividende={opp['dividend_amount']:.4f}) <<<")
+                    print(f"    Action={opp['stock_price']:.2f}  Future={opp['future_price']:.2f}  "
+                          f"Coût={opp['total_cost']:.4f}  Profit={opp['profit_net']:+.4f} ({opp['profit_net_pct']:+.4f}%)")
+
+                    if getattr(config, 'EXECUTE_ORDERS', False):
+                        print("    [EXECUTION] Placement des ordres réels...")
+                        self.place_spread_order(
+                            opp['stock_contract'],
+                            opp['future_contract'],
+                            opp['stock_price'],
+                            opp['future_price']
+                        )
+                    else:
+                        print("    [SIMULATION] Ordres NON exécutés (EXECUTE_ORDERS=False).")
+                        print(f"    -> Achat {opp['stock']} / Vente {opp['future']} (exp={opp['expiry']})")
+
+                    time.sleep(5)
+
+            print("\nSession Dividend Capture terminée avec succès")
+
+        except Exception as e:
+            print(f"Erreur lors de la session Dividend Capture: {e}")
+
+        finally:
+            self.disconnect_from_ibkr()
+
+    def close_dividend_capture_positions(self):
+        """Fermer les positions Dividend Capture ouvertes (dénouement J+1)"""
+        try:
+            if not self.connect_to_ibkr():
+                return
+
+            # Lire les positions ouvertes dans la DB
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, symbol, asset_type, quantity, entry_price, future_symbol
+                    FROM positions
+                    WHERE status = 'OPEN'
+                    ORDER BY entry_time DESC
+                ''')
+                open_positions = cursor.fetchall()
+
+            if not open_positions:
+                print("Aucune position ouverte à fermer")
+                return
+
+            print(f"\n{'='*80}")
+            print(f"  DÉNOUEMENT : {len(open_positions)} position(s) ouverte(s)")
+            print(f"{'='*80}")
+
+            for pos in open_positions:
+                pos_id, symbol, asset_type, quantity, entry_price, future_symbol = pos
+                print(f"\n  Position #{pos_id}: {symbol} ({asset_type}) qty={quantity} prix_entrée={entry_price:.2f}")
+
+                if getattr(config, 'EXECUTE_ORDERS', False):
+                    if asset_type == 'STOCK':
+                        contract = self.create_stock_contract(symbol)
+                        order_id = self.ib.next_order_id
+                        order = self.create_order('SELL', abs(int(quantity)))
+                        self.ib.placeOrder(order_id, contract, order)
+                        self.ib.next_order_id += 1
+                        print(f"    [EXECUTION] Vente {int(abs(quantity))} {symbol}")
+                    elif asset_type == 'FUTURE':
+                        contract = self.create_future_contract(symbol)
+                        order_id = self.ib.next_order_id
+                        order = self.create_order('BUY', abs(int(quantity)))
+                        self.ib.placeOrder(order_id, contract, order)
+                        self.ib.next_order_id += 1
+                        print(f"    [EXECUTION] Rachat {int(abs(quantity))} {symbol}")
+
+                    with sqlite3.connect(DB_NAME) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            UPDATE positions SET status = 'CLOSED', exit_time = ?
+                            WHERE id = ?
+                        ''', (datetime.now(), pos_id))
+                        conn.commit()
+
+                    time.sleep(2)
+                else:
+                    action = 'Vente' if asset_type == 'STOCK' else 'Rachat'
+                    print(f"    [SIMULATION] {action} {symbol} (EXECUTE_ORDERS=False)")
+
+            print("\nDénouement terminé")
+
+        except Exception as e:
+            print(f"Erreur lors du dénouement: {e}")
+
+        finally:
+            self.disconnect_from_ibkr()
+
+
 def main():
     """Fonction principale"""
-    print("Démarrage du programme Cash and Carry pour IBKR (API native)")
-    print(f"Mode: {'TEMPS RÉEL' if USE_REAL_TIME_DATA else 'DIFFÉRÉ (Demo)'}")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Programme de trading IBKR — Cash & Carry et Dividend Capture'
+    )
+    parser.add_argument(
+        '--strategy', '-s',
+        choices=['cashcarry', 'divcapture', 'divclose'],
+        default='cashcarry',
+        help='Stratégie: cashcarry (défaut), divcapture (ouverture dividend capture), divclose (fermeture J+1)'
+    )
+    parser.add_argument(
+        '--date', '-d',
+        type=str,
+        default=None,
+        help='Date cible pour dividend capture (YYYY-MM-DD, défaut: aujourd\'hui)'
+    )
+    parser.add_argument(
+        '--market', '-m',
+        type=str,
+        default=None,
+        help='Marché cible (ex: EUROZONE, US, UK, SWISS)'
+    )
+
+    args = parser.parse_args()
+
+    print("Démarrage du programme de trading IBKR (API native)")
     print(f"Compte: {ACCOUNT_ID}")
-    print(f"Chemin TWS: {TWS_PATH}")
-    print("Utilisation de l'API native IBKR depuis C:/TWS API/source/pythonclient")
-    print(f"Données de marché: {DATA_MODE}")
+    print(f"Stratégie: {args.strategy}")
 
     trader = CashCarryTrader()
 
-    # Exécuter une session de trading
-    trader.run_trading_session()
+    # Changer de marché si demandé
+    if args.market:
+        if not trader.set_market(args.market):
+            return
+
+    if args.strategy == 'cashcarry':
+        trader.run_trading_session()
+    elif args.strategy == 'divcapture':
+        trader.run_dividend_capture_session(target_date=args.date)
+    elif args.strategy == 'divclose':
+        trader.close_dividend_capture_positions()
 
 if __name__ == "__main__":
     main()

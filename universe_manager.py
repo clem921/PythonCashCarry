@@ -64,7 +64,13 @@ class UniverseDatabase:
                 ('payment_date', 'TEXT DEFAULT \'\''),
                 ('dividend_amount', 'REAL DEFAULT 0'),
                 ('derivative_category', 'TEXT DEFAULT \'\''),
-                ('yfinance_available', 'INTEGER DEFAULT 1')
+                ('yfinance_available', 'INTEGER DEFAULT 1'),
+                ('dividend_source', "TEXT DEFAULT ''"),
+                ('dividend_last_updated', "TEXT DEFAULT ''"),
+                ('ibkr_div_next_date', "TEXT DEFAULT ''"),
+                ('ibkr_div_next_amount', 'REAL DEFAULT 0'),
+                ('ibkr_div_past_12m', 'REAL DEFAULT 0'),
+                ('ibkr_div_annual', 'REAL DEFAULT 0'),
             ]
             
             for col_name, col_def in new_columns:
@@ -369,11 +375,14 @@ class UniverseDatabase:
         with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
             try:
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 cursor.execute('''
                     UPDATE managed_assets 
-                    SET ex_dividend_date = ?, payment_date = ?, dividend_amount = ?, yfinance_available = ?, last_updated = ?
+                    SET ex_dividend_date = ?, payment_date = ?, dividend_amount = ?, 
+                        yfinance_available = ?, dividend_source = 'yfinance',
+                        dividend_last_updated = ?, last_updated = ?
                     WHERE symbol = ? AND exchange = ? AND currency = ?
-                ''', (ex_dividend_date, payment_date, dividend_amount, yfinance_available, datetime.now(), symbol, exchange, currency))
+                ''', (ex_dividend_date, payment_date, dividend_amount, yfinance_available, now, datetime.now(), symbol, exchange, currency))
                 if cursor.rowcount == 0:
                     print(f"[DB] update_dividend: 0 lignes mises à jour pour {symbol} (exchange={exchange}, currency={currency})")
                     conn.commit()
@@ -382,6 +391,75 @@ class UniverseDatabase:
                 return True
             except Exception as e:
                 print(f"ERREUR lors de la mise à jour du dividende pour {symbol}: {e}")
+                return False
+
+    def update_dividend_ibkr(self, symbol, exchange='SMART', currency='EUR',
+                             ibkr_div_next_date='', ibkr_div_next_amount=0,
+                             ibkr_div_past_12m=0, ibkr_div_annual=0):
+        """Mettre a jour les informations de dividende depuis IBKR (generic tick 456).
+        
+        Met aussi a jour ex_dividend_date et dividend_amount si IBKR fournit
+        une prochaine date ex-dividende (priorite sur yfinance pour les dates futures).
+        
+        Args:
+            symbol: Symbole de l'actif
+            exchange: Exchange (defaut: SMART)
+            currency: Devise (defaut: EUR)
+            ibkr_div_next_date: Prochaine date ex-div (YYYY-MM-DD)
+            ibkr_div_next_amount: Montant du prochain dividende
+            ibkr_div_past_12m: Total dividendes 12 derniers mois
+            ibkr_div_annual: Dividende annuel estime
+        
+        Returns:
+            bool: True si mise a jour reussie
+        """
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            try:
+                # Mettre a jour les colonnes IBKR
+                update_fields = '''
+                    ibkr_div_next_date = ?,
+                    ibkr_div_next_amount = ?,
+                    ibkr_div_past_12m = ?,
+                    ibkr_div_annual = ?,
+                    dividend_source = CASE 
+                        WHEN ? != '' THEN 'ibkr'
+                        ELSE dividend_source 
+                    END,
+                    dividend_last_updated = ?,
+                    last_updated = ?
+                '''
+                params = [
+                    ibkr_div_next_date, ibkr_div_next_amount,
+                    ibkr_div_past_12m, ibkr_div_annual,
+                    ibkr_div_next_date,  # for CASE condition
+                    now, datetime.now()
+                ]
+                
+                # Si IBKR fournit une prochaine date, mettre aussi a jour ex_dividend_date/dividend_amount
+                if ibkr_div_next_date and ibkr_div_next_amount > 0:
+                    update_fields += ''',
+                        ex_dividend_date = ?,
+                        dividend_amount = ?
+                    '''
+                    params.extend([ibkr_div_next_date, ibkr_div_next_amount])
+                
+                params.extend([symbol, exchange, currency])
+                
+                cursor.execute(f'''
+                    UPDATE managed_assets 
+                    SET {update_fields}
+                    WHERE symbol = ? AND exchange = ? AND currency = ?
+                ''', params)
+                
+                if cursor.rowcount == 0:
+                    return False
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"ERREUR update_dividend_ibkr pour {symbol}: {e}")
                 return False
 
     def get_dividend(self, symbol, exchange='SMART', currency='EUR'):
@@ -496,6 +574,56 @@ class UniverseDatabase:
                     'dividend_amount': row[5]
                 })
             return dividends
+
+    def get_exdividend_today(self, region_currency=None, target_date=None):
+        """Récupérer les actifs dont la date ex-dividende est aujourd'hui (ou target_date)
+        
+        Args:
+            region_currency: Filtrer par devise (optionnel)
+            target_date: Date cible au format YYYY-MM-DD (défaut: aujourd'hui)
+        
+        Returns:
+            Liste de dicts avec les infos des actifs ex-dividende du jour
+        """
+        if target_date is None:
+            target_date = datetime.now().strftime('%Y-%m-%d')
+        
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            query = '''
+                SELECT symbol, exchange, currency, ex_dividend_date, payment_date, dividend_amount,
+                       underlying_symbol, primary_exchange, derivatives_exchange, future_symbol,
+                       underlying_primary_exchange
+                FROM managed_assets 
+                WHERE active = 1 
+                AND ex_dividend_date = ?
+                AND dividend_amount > 0
+            '''
+            params = [target_date]
+            if region_currency:
+                query += ' AND currency = ?'
+                params.append(region_currency)
+            query += ' ORDER BY dividend_amount DESC'
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            assets = []
+            for row in rows:
+                assets.append({
+                    'symbol': row[0],
+                    'exchange': row[1],
+                    'currency': row[2],
+                    'ex_dividend_date': row[3],
+                    'payment_date': row[4],
+                    'dividend_amount': row[5],
+                    'underlying_symbol': row[6] or '',
+                    'primary_exchange': row[7] or '',
+                    'derivatives_exchange': row[8] or '',
+                    'future_symbol': row[9] or '',
+                    'underlying_primary_exchange': row[10] or '',
+                })
+            return assets
 
     def get_summary(self):
         """Obtenir un résumé de la base de données"""

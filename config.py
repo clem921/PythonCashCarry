@@ -7,9 +7,7 @@ IBKR_CONFIG = {
     'host': '127.0.0.1',
     'port': 7497,  # Port par défaut pour TWS
     'client_id': 2,
-    'account_id': '',  # Votre account ID IBKR (ex: 'DU1234567')
-    'tws_path': r'C:\TWS API',  # Chemin vers TWS API (adapter selon votre installation)
-    'paper_trading': True  # Mode papier (demo)
+    'account_id': 'DU7117267',  # Compte démo
 }
 
 # Type de données de marché (1: Live, 2: Frozen, 3: Delayed, 4: Delayed Frozen)
@@ -24,26 +22,18 @@ MAX_TRADES_PER_SESSION = 1 # Only take the BEST opportunity per session.
 MARKETS = {
     'US': {
         'enabled': True,
-        'stock_exchange': 'SMART',
-        'future_exchange': '',
         'currency': 'USD',
     },
     'EUROZONE': {
         'enabled': True,
-        'stock_exchange': 'SMART',
-        'future_exchange': '',
         'currency': 'EUR',
     },
     'UK': {
         'enabled': False,
-        'stock_exchange': 'SMART',
-        'future_exchange': '',
         'currency': 'GBP',
     },
     'SWISS': {
         'enabled': False,
-        'stock_exchange': 'SMART',
-        'future_exchange': '',
         'currency': 'CHF',
     }
 }
@@ -54,6 +44,14 @@ STRATEGY_CONFIG = {
     'max_position_size': 10000,  # Taille maximale de position en devise locale
     'max_days_to_expiry': 180,  # Jours maximum avant échéance pour ouvrir (6 mois)
     'min_days_to_close': 2,  # Jours minimum avant échéance pour fermer
+}
+
+# Configuration de la stratégie Dividend Capture (achat action + vente future le jour ex-dividende)
+DIVIDEND_CAPTURE_CONFIG = {
+    'min_profit_pct': 0.1,           # Rentabilité nette minimum (% du nominal investi) pour considérer l'opportunité
+    'max_position_size': 10000,      # Taille maximale de position en devise locale
+    'preferred_future_expiry_days': 30,  # Préférer les futures expirant dans ~30 jours (court terme)
+    'max_future_expiry_days': 180,   # Expiration max du future considéré
 }
 
 # Coûts de portage — valeurs par défaut si IBKR ne fournit pas de what-if
@@ -71,24 +69,30 @@ COST_CONFIG = {
     'ftt_rate_it': 0.001,              # TTF Italie (0.1%)
 }
 
+# Mapping exchange primaire IBKR -> devise native de l'action
+# Utilisé pour créer les contrats actions cross-currency (ex: ULVR coté au LSE en GBP)
+EXCHANGE_CURRENCY = {
+    'SBF': 'EUR',     # Paris
+    'AEB': 'EUR',     # Amsterdam
+    'BVB': 'EUR',     # Brussels
+    'EBR': 'EUR',     # Brussels (variante)
+    'IBIS': 'EUR',    # Xetra / Francfort
+    'BVME': 'EUR',    # Borsa Italiana (Milan)
+    'BM': 'EUR',      # Bolsa de Madrid
+    'ENXL': 'EUR',    # Euronext Lisbon
+    'HEX': 'EUR',     # Helsinki (Nasdaq Nordic)
+    'LSE': 'GBP',     # London Stock Exchange
+    'OSE': 'NOK',     # Oslo
+    'CSE': 'DKK',     # Copenhagen (Nasdaq Nordic)
+    'SFB': 'SEK',     # Stockholm (Nasdaq Nordic)
+    'EBS': 'CHF',     # SIX Swiss Exchange
+    'VSE': 'EUR',     # Vienna
+    'ISE': 'EUR',     # Irish Stock Exchange (Dublin)
+}
+
 # Configuration de la base de données
 DB_CONFIG = {
     'name': 'cash_carry_positions.db',
     'table_name': 'positions'
 }
 
-# Configuration des logs
-LOG_CONFIG = {
-    'level': 'INFO',
-    'file': 'cash_carry_trader.log',
-    'max_size': 1024 * 1024 * 5,  # 5 MB
-    'backup_count': 3
-}
-
-# Configuration des notifications
-NOTIFICATION_CONFIG = {
-    'email_enabled': False,
-    'email_to': 'trader@example.com',
-    'sms_enabled': False,
-    'sms_to': '+1234567890'
-}

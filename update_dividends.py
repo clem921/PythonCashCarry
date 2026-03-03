@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Script pour mettre à jour les informations de dividendes dans la base de données.
-Utilise yfinance pour récupérer les dates ex-dividende, dates de paiement et montants.
+Script pour mettre a jour les informations de dividendes dans la base de donnees.
+
+Sources disponibles:
+  - yfinance (defaut) : historique dividendes via Yahoo Finance
+  - ibkr : donnees live depuis IBKR TWS (generic tick 456) — requiert TWS connecte
 
 Usage:
-    python update_dividends.py              # Met à jour tous les actifs de la base
-    python update_dividends.py --symbol MC  # Met à jour un symbole spécifique
-    python update_dividends.py --currency EUR  # Met à jour les actifs en EUR uniquement
+    python update_dividends.py                          # yfinance, tous les actifs
+    python update_dividends.py --source ibkr            # IBKR, tous les actifs (TWS requis)
+    python update_dividends.py --source ibkr -s AS6     # IBKR, un symbole
+    python update_dividends.py --source ibkr -c EUR     # IBKR, actifs EUR uniquement
+    python update_dividends.py --symbol MC              # yfinance, un symbole
+    python update_dividends.py --currency EUR            # yfinance, actifs EUR
+    python update_dividends.py --show                   # Afficher les dividendes a venir
 """
 
 import argparse
+import sys
 import pandas as pd
 import time
 from datetime import datetime
+from threading import Thread, Event
 from universe_manager import UniverseDatabase
+import config
 
 # Mapping des suffixes yfinance par exchange
 # Utilise primary_exchange (config) ou derivatives_exchange (base SQLite)
@@ -328,6 +338,360 @@ def update_single_dividend(db, symbol, currency='EUR'):
         db.update_dividend(symbol=symbol, exchange=exchange, currency=currency, yfinance_available=1)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOURCE IBKR : Recuperation des dividendes via l'API native IBKR (generic tick 456)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class IBDividendApp:
+    """Client IBKR leger dedie a la recuperation des dividendes.
+    
+    Utilise reqMktData avec genericTickList="456" qui retourne les infos dividende
+    via le callback tickString (tickType 59).
+    Format: "past12m,nextDate,nextAmount,nextAnnual" (separateur virgule ou point-virgule)
+    """
+
+    def __init__(self):
+        # Import IBKR API
+        sys.path.append(r'C:/TWS API/source/pythonclient')
+        from ibapi.client import EClient
+        from ibapi.wrapper import EWrapper
+        
+        # Creer la classe dynamiquement pour eviter l'import global
+        parent = self
+        
+        class _App(EWrapper, EClient):
+            def __init__(self):
+                EClient.__init__(self, self)
+                self.connected = False
+                self.dividend_data = {}   # reqId -> dividend string
+                self.data_events = {}     # reqId -> Event
+                self._next_req_id = 20000
+
+            def get_next_req_id(self):
+                req_id = self._next_req_id
+                self._next_req_id += 1
+                return req_id
+
+            def nextValidId(self, orderId):
+                self.connected = True
+                print(f"Connecte a IBKR TWS (orderId={orderId})")
+
+            def tickString(self, reqId, tickType, value):
+                """Callback pour les donnees textuelles — tickType 59 = IB Dividends"""
+                super().tickString(reqId, tickType, value)
+                if tickType == 59 and value:
+                    self.dividend_data[reqId] = value
+                    if reqId in self.data_events:
+                        self.data_events[reqId].set()
+
+            def tickPrice(self, reqId, tickType, price, attrib):
+                """Ignorer les ticks de prix (on ne veut que les dividendes)"""
+                pass
+
+            def tickSize(self, reqId, tickType, size):
+                pass
+
+            def tickGeneric(self, reqId, tickType, value):
+                pass
+
+            def tickSnapshotEnd(self, reqId):
+                """Fin du snapshot — liberer l'event meme si pas de dividende recu"""
+                if reqId in self.data_events:
+                    self.data_events[reqId].set()
+
+            def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+                silent_codes = [2104, 2106, 2158, 10167]
+                if errorCode in silent_codes:
+                    pass
+                elif errorCode == 200:
+                    # Pas de definition de titre — pas bloquant
+                    if reqId in self.data_events:
+                        self.data_events[reqId].set()
+                else:
+                    if errorCode not in [10090]:  # market data farm connecting
+                        print(f"  [IBKR] Erreur reqId={reqId} code={errorCode}: {errorString}")
+                    if reqId in self.data_events:
+                        self.data_events[reqId].set()
+
+        self.app = _App()
+
+    def connect(self):
+        """Se connecter a IBKR TWS"""
+        host = config.IBKR_CONFIG['host']
+        port = config.IBKR_CONFIG['port']
+        client_id = config.IBKR_CONFIG['client_id'] + 10  # Eviter conflit avec main.py
+
+        self.app.connect(host, port, clientId=client_id)
+        thread = Thread(target=self.app.run, daemon=True)
+        thread.start()
+
+        # Attendre la connexion
+        for _ in range(30):
+            if self.app.connected:
+                # Configurer le type de donnees de marche
+                self.app.reqMarketDataType(config.MARKET_DATA_TYPE)
+                return True
+            time.sleep(0.2)
+        
+        print("ERREUR: Impossible de se connecter a IBKR TWS")
+        return False
+
+    def disconnect(self):
+        self.app.disconnect()
+        print("Deconnecte de IBKR TWS")
+
+    def fetch_dividend(self, symbol, primary_exchange='', currency='EUR'):
+        """Recuperer les infos dividende pour un symbole via IBKR.
+        
+        Strategie de resolution :
+        1. Essayer avec primaryExchange (si fourni)
+        2. Fallback sans primaryExchange (juste SMART + currency)
+        3. Pour les symboles nordiques composites (NOVOB, NSISB...),
+           essayer avec un espace avant le suffixe de classe (NOVO B, NSIS B)
+        
+        Args:
+            symbol: Symbole du sous-jacent (ex: 'ASML', 'ULVR')
+            primary_exchange: Exchange primaire (ex: 'AEB', 'LSE')
+            currency: Devise native du sous-jacent
+        
+        Returns:
+            dict avec ibkr_div_next_date, ibkr_div_next_amount, ibkr_div_past_12m, 
+            ibkr_div_annual, ou None si echec
+        """
+        # Construire la liste de tentatives : (symbole, primaryExchange)
+        attempts = []
+        if primary_exchange:
+            attempts.append((symbol, primary_exchange))
+        attempts.append((symbol, ''))  # Fallback sans primaryExchange
+        
+        # Pour les symboles nordiques composites (suffixe A/B),
+        # ajouter une tentative avec espace : NOVOB -> NOVO B
+        nordic_exchanges = {'SFB', 'CSE', 'HEX', 'OSE'}
+        if primary_exchange in nordic_exchanges and len(symbol) > 1 and symbol[-1] in 'AB':
+            spaced = symbol[:-1] + ' ' + symbol[-1]
+            attempts.append((spaced, primary_exchange))
+            attempts.append((spaced, ''))
+        
+        from ibapi.contract import Contract
+
+        for try_symbol, try_exchange in attempts:
+            contract = Contract()
+            contract.symbol = try_symbol
+            contract.secType = 'STK'
+            contract.exchange = 'SMART'
+            contract.currency = currency
+            if try_exchange:
+                contract.primaryExchange = try_exchange
+
+            req_id = self.app.get_next_req_id()
+            self.app.data_events[req_id] = Event()
+
+            self.app.reqMktData(req_id, contract, "456", False, False, [])
+            self.app.data_events[req_id].wait(timeout=6)
+            self.app.cancelMktData(req_id)
+
+            raw = self.app.dividend_data.get(req_id)
+            if raw:
+                return self._parse_dividend_string(raw, symbol)
+
+        return None
+
+    def _parse_dividend_string(self, raw, symbol=''):
+        """Parser la chaine de dividende IBKR (generic tick 456, tickType 59).
+        
+        Format IBKR documente:
+            "past12m,nextDate,nextAmount,nextDate2,nextAmount2,...,annualAmount"
+        Le separateur peut etre ',' ou ';'.
+        Les champs sont: total 12 mois, puis paires (date, montant) pour chaque
+        dividende futur, et en dernier le dividende annuel estime.
+        """
+        # Determiner le separateur
+        if ';' in raw:
+            parts = raw.split(';')
+        else:
+            parts = raw.split(',')
+
+        result = {
+            'ibkr_div_past_12m': 0,
+            'ibkr_div_next_date': '',
+            'ibkr_div_next_amount': 0,
+            'ibkr_div_annual': 0,
+        }
+
+        try:
+            # Classifier chaque element : nombre ou date (YYYYMMDD)
+            numbers = []
+            dates = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                if len(p) == 8 and p.isdigit() and p[:2] in ('19', '20'):
+                    # C'est une date YYYYMMDD
+                    dates.append(f"{p[:4]}-{p[4:6]}-{p[6:8]}")
+                else:
+                    try:
+                        numbers.append(float(p))
+                    except ValueError:
+                        pass
+
+            # Interpretation :
+            # - Premier nombre = total dividendes 12 derniers mois
+            # - Dernier nombre = dividende annuel estime
+            # - Nombres intermediaires = montants des prochains dividendes
+            # - Dates = dates ex-dividende correspondantes
+            if numbers:
+                result['ibkr_div_past_12m'] = numbers[0]
+            if len(numbers) >= 2:
+                result['ibkr_div_annual'] = numbers[-1]
+            if len(numbers) >= 3:
+                # Les nombres entre le premier et le dernier sont les montants
+                result['ibkr_div_next_amount'] = numbers[1]
+            if dates:
+                result['ibkr_div_next_date'] = dates[0]  # Premiere date = prochain ex-div
+
+        except Exception as e:
+            print(f"  [IBKR] Erreur parsing dividende '{raw}': {e}")
+
+        return result
+
+
+# Mapping exchange derives Euronext -> exchange actions IBKR (pour fallback)
+# Utilise quand underlying_primary_exchange est vide
+_DERIV_TO_STOCK_EXCHANGE = {
+    'DPAR': 'SBF',    # Euronext Paris Derivatives -> Paris
+    'DAMS': 'AEB',    # Euronext Amsterdam Derivatives -> Amsterdam
+    'DBRU': 'EBR',    # Euronext Brussels Derivatives -> Brussels
+    'DMIL': 'BVME',   # Euronext Milan Derivatives -> Milan
+    'DOSL': 'OSE',    # Euronext Oslo Derivatives -> Oslo
+    'DLIS': 'ENXL',   # Euronext Lisbon Derivatives -> Lisbon
+}
+
+
+def update_dividends_ibkr(db, currency_filter=None, category_filter=None, symbol_filter=None):
+    """Mettre a jour les dividendes via l'API IBKR (generic tick 456).
+    
+    Se connecte a TWS, parcourt les actifs de la base et recupere les infos
+    de dividende pour chaque sous-jacent.
+    
+    Args:
+        db: Instance UniverseDatabase
+        currency_filter: Filtrer par devise (optionnel)
+        category_filter: Filtrer par categorie (optionnel)
+        symbol_filter: Mettre a jour un seul symbole (optionnel)
+    """
+    ibkr = IBDividendApp()
+    if not ibkr.connect():
+        return
+
+    if symbol_filter:
+        asset = db.get_asset_by_symbol(symbol_filter)
+        if not asset:
+            print(f"ERREUR: Actif {symbol_filter} non trouve dans la base")
+            ibkr.disconnect()
+            return
+        assets = [asset]
+    else:
+        assets = db.get_active_assets(region_currency=currency_filter, category=category_filter)
+
+    print(f"\nMise a jour des dividendes via IBKR pour {len(assets)} actifs...")
+    print("-" * 60)
+
+    success_count = 0
+    error_count = 0
+    skipped_count = 0
+    # Deduplication par sous-jacent pour eviter les requetes redondantes
+    # (ex: AS6, AS7 ont le meme sous-jacent ASML)
+    seen_underlyings = {}  # underlying_symbol -> resultat
+
+    try:
+        for asset in assets:
+            symbol = asset['symbol']
+            underlying_symbol = asset.get('underlying_symbol', '')
+            primary_exchange = asset.get('primary_exchange', '')
+            underlying_primary_exchange = asset.get('underlying_primary_exchange', '')
+            derivatives_exchange = asset.get('derivatives_exchange', '')
+            exchange = asset.get('exchange', 'SMART')
+            currency = asset['currency']
+            derivative_category = asset.get('derivative_category', '')
+
+            # Le ticker a interroger est le sous-jacent
+            ticker = underlying_symbol or symbol
+            if not ticker:
+                skipped_count += 1
+                continue
+
+            # Ignorer les dividend-stock-futures dont le underlying_symbol est
+            # un ISIN synthetique (SSDF...) et non un vrai symbole action
+            if ticker.startswith('SSDF') or ticker.startswith('QS00'):
+                skipped_count += 1
+                continue
+
+            # Determiner l'exchange du sous-jacent :
+            # 1. underlying_primary_exchange (explicite)
+            # 2. Deriver depuis derivatives_exchange (DPAR->SBF, DAMS->AEB...)
+            # NB: primary_exchange pour un FUT = derivatives_exchange, pas l'exchange actions
+            und_exchange = underlying_primary_exchange
+            if not und_exchange and derivatives_exchange:
+                und_exchange = _DERIV_TO_STOCK_EXCHANGE.get(derivatives_exchange, '')
+            native_currency = config.EXCHANGE_CURRENCY.get(und_exchange, currency)
+
+            # Deduplication : reutiliser le resultat si deja recupere
+            dedup_key = (ticker, und_exchange, native_currency)
+            if dedup_key in seen_underlyings:
+                div_info = seen_underlyings[dedup_key]
+                print(f"[{symbol}] Reutilisation du resultat pour {ticker} (deja recupere)")
+            else:
+                print(f"[{symbol}] Requete IBKR pour {ticker} (exchange={und_exchange}, devise={native_currency})...", end=" ")
+                div_info = ibkr.fetch_dividend(ticker, und_exchange, native_currency)
+                seen_underlyings[dedup_key] = div_info
+
+                if div_info is None:
+                    print("Pas de donnee dividende")
+                    error_count += 1
+                    # Pause entre les requetes
+                    time.sleep(0.3)
+                    continue
+                else:
+                    next_d = div_info['ibkr_div_next_date'] or '-'
+                    next_a = div_info['ibkr_div_next_amount']
+                    past = div_info['ibkr_div_past_12m']
+                    annual = div_info['ibkr_div_annual']
+                    print(f"OK next={next_d} amt={next_a:.4f} past12m={past:.4f} annual={annual:.4f}")
+
+            if div_info is None:
+                error_count += 1
+                continue
+
+            # Sauvegarder en base
+            success = db.update_dividend_ibkr(
+                symbol=symbol,
+                exchange=exchange,
+                currency=currency,
+                ibkr_div_next_date=div_info['ibkr_div_next_date'],
+                ibkr_div_next_amount=div_info['ibkr_div_next_amount'],
+                ibkr_div_past_12m=div_info['ibkr_div_past_12m'],
+                ibkr_div_annual=div_info['ibkr_div_annual'],
+            )
+            if success:
+                success_count += 1
+            else:
+                error_count += 1
+
+            # Pause entre les requetes pour eviter le throttling IBKR
+            time.sleep(0.3)
+
+    except KeyboardInterrupt:
+        print("\n\nINTERRUPTION par l'utilisateur. Arret de la mise a jour...")
+
+    ibkr.disconnect()
+
+    print("\n" + "=" * 60)
+    unique = len(seen_underlyings)
+    print(f"Termine: {success_count} MAJ, {error_count} erreurs, {skipped_count} ignores")
+    print(f"  {unique} sous-jacent(s) unique(s) interroge(s) pour {len(assets)} actifs")
+
+
 def show_upcoming_dividends(db, currency_filter=None):
     """Afficher les dividendes à venir
     
@@ -373,7 +737,13 @@ def main():
     parser.add_argument(
         '--show', '-S',
         action='store_true',
-        help='Afficher uniquement les dividendes à venir (pas de mise à jour)'
+        help='Afficher uniquement les dividendes a venir (pas de mise a jour)'
+    )
+    parser.add_argument(
+        '--source',
+        choices=['yfinance', 'ibkr'],
+        default='yfinance',
+        help='Source des donnees: yfinance (defaut) ou ibkr (requiert TWS connecte)'
     )
     
     args = parser.parse_args()
@@ -381,6 +751,13 @@ def main():
     db = UniverseDatabase()
     
     if args.show:
+        show_upcoming_dividends(db, args.currency)
+    elif args.source == 'ibkr':
+        update_dividends_ibkr(db,
+                              currency_filter=args.currency,
+                              category_filter=args.type,
+                              symbol_filter=args.symbol)
+        print("\n")
         show_upcoming_dividends(db, args.currency)
     elif args.symbol:
         update_single_dividend(db, args.symbol, args.currency or 'EUR')

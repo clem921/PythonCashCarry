@@ -1,16 +1,22 @@
 import os
 import subprocess
 import pandas as pd
+from pandas.tseries.holiday import GoodFriday, Holiday
 import requests
 import time
-import json
 import re
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from universe_manager import UniverseDatabase
 import config
 
 INPUTS_DIR = "inputs"
+
+# Jour férié italien : 15 août (Ferragosto / Assomption) — marché IDEM fermé
+FERRAGOSTO = Holiday('Ferragosto', month=8, day=15)
+# Exchanges IDEM (Milan) concernés par le Ferragosto
+_IDEM_EXCHANGES = {'DMIL', 'XMIL'}
 
 # Constants for API endpoints and headers
 EURONEXT_BASE_URL = "https://live.euronext.com"
@@ -30,77 +36,10 @@ EUREX_HEADERS = {
     'Connection': 'keep-alive'
 }
 
-def get_euronext_equities_map():
-    """
-    AMÉLIORÉ: Construit une table ISIN -> Ticker pour les actions Euronext.
-    """
-    print("Mise à jour de la carte ISIN -> Ticker (Actions)...")
-    isin_ticker_map = {}
-    session = requests.Session()
-    session.headers.update(EURONEXT_HEADERS)
-    
-    for page in range(50): # Suffisant pour ~2500 instruments
-        url = f"https://live.euronext.com/en/products/equities/list?page={page}"
-        try:
-            response = session.get(url, timeout=15)
-            if response.status_code != 200: break
-                
-            html = response.text
-            # Utiliser une regex robuste (insensible à la casse, gère les attributs)
-            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S | re.I)
-            if not rows or len(rows) < 5: break
-                
-            found_on_page = 0
-            for row in rows:
-                if '<th' in row.lower() and 'priority-' not in row.lower(): continue # Skip real headers
-                # Chercher th ou td pour les cellules
-                tds = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.S | re.I)
-                if len(tds) >= 3:
-                    # En Equities: Col 1: Ticker, Col 2: ISIN
-                    ticker = re.sub(r'<[^>]+>', '', tds[1]).strip()
-                    isin = re.sub(r'<[^>]+>', '', tds[2]).strip()
-                    
-                    if len(isin) == 12 and isin[0:2].isalpha() and ticker:
-                        isin_ticker_map[isin] = ticker
-                        found_on_page += 1
-            
-            print(f"  Page {page + 1}: {found_on_page} actions mappées", end='\r')
-            if 'page=' + str(page + 1) not in html.lower(): break
-            time.sleep(0.1)
-        except: break
-            
-    print(f"\nCarte prête: {len(isin_ticker_map)} tickers enregistrés.")
-    return isin_ticker_map
-
-def get_euronext_metadata(isin, mic='XPAR'):
-    """
-    AMÉLIORÉ: Extrait le ticker (symbol) et le nom complet depuis la page produit Euronext via le bloc JSON.
-    C'est la méthode la plus robuste car elle évite le parsing HTML fragile.
-    """
-    url = f"https://live.euronext.com/en/product/equities/{isin}-{mic}"
-    try:
-        response = requests.get(url, headers=EURONEXT_HEADERS, timeout=10)
-        if response.status_code == 200:
-            html = response.text
-            # Chercher le bloc drupal-settings-json
-            match = re.search(r'<script type="application/json" data-drupal-selector="drupal-settings-json">(.*?)</script>', html, re.S)
-            if match:
-                data = json.loads(match.group(1))
-                instr_info = data.get('custom', {}).get('instrument', {})
-                if instr_info:
-                    return {
-                        'ticker': instr_info.get('symbol'),
-                        'name': instr_info.get('name'),
-                        'isin': instr_info.get('isin'),
-                        'mic': instr_info.get('mic')
-                    }
-    except Exception as e:
-        pass
-    return None
-
 def get_euronext_expirations(future_symbol, exchange, category="stock-futures"):
     """
     Récupérer les dates d'expiration pour un future donné via l'API AJAX getPricesFutures.
+    Calcule le 3ème vendredi du mois (et gère le Vendredi Saint + Ferragosto pour IDEM).
     Retourne une liste de dates au format DD/MM/YYYY.
     """
     ajax_headers = {
@@ -113,12 +52,41 @@ def get_euronext_expirations(future_symbol, exchange, category="stock-futures"):
     try:
         response = requests.get(url, headers=ajax_headers, timeout=10)
         if response.status_code == 200:
-            # Les dates sont dans les paramètres md=DD-MM-YYYY des liens
+            # Les dates brutes sont le 1er du mois : md=01-MM-YYYY
             md_dates = re.findall(r'md=(\d{2}-\d{2}-\d{4})', response.text)
-            if md_dates:
-                # Convertir DD-MM-YYYY en DD/MM/YYYY pour cohérence
-                dates = [d.replace('-', '/') for d in md_dates]
-                return sorted(list(set(dates)))
+            
+            dates_exactes = set()
+            for md in md_dates:
+                try:
+                    # md au format DD-MM-YYYY (généralement 01-MM-YYYY)
+                    d = pd.Timestamp(f"{md[6:]}-{md[3:5]}-01")
+                    # On cherche le 3ème vendredi (week=2 car indexé à 0, weekday=4 pour vendredi)
+                    third_friday = d + pd.offsets.WeekOfMonth(week=2, weekday=4)
+                    
+                    # Vérifier si le 3ème vendredi tombe un jour férié
+                    is_holiday = False
+                    
+                    # Vendredi Saint (tous les marchés Euronext)
+                    gf_dates = GoodFriday.dates(d, d + pd.Timedelta(days=31))
+                    if len(gf_dates) > 0 and third_friday == gf_dates[0]:
+                        is_holiday = True
+                    
+                    # Ferragosto — 15 août (IDEM / Milan uniquement)
+                    if not is_holiday and exchange in _IDEM_EXCHANGES:
+                        fg_dates = FERRAGOSTO.dates(d, d + pd.Timedelta(days=31))
+                        if len(fg_dates) > 0 and third_friday in fg_dates:
+                            is_holiday = True
+                    
+                    # Si jour férié, avancer au jour ouvré précédent (jeudi)
+                    exact_date = third_friday - pd.Timedelta(days=1) if is_holiday else third_friday
+                        
+                    dates_exactes.add(exact_date.strftime('%d/%m/%Y'))
+                except Exception as e:
+                    pass
+                    
+            if dates_exactes:
+                # Trier par ordre chronologique
+                return sorted(list(dates_exactes), key=lambda x: pd.Timestamp(f"{x[6:]}-{x[3:5]}-{x[:2]}"))
     except:
         pass
     return []
@@ -467,6 +435,12 @@ def download_euronext_data(categories=None):
                     underlying_ticker, underlying_primary_exchange = resolve_underlying_ticker(underlying_isin, isin_ticker_cache)
                     if underlying_ticker:
                         total_enriched += 1
+                    
+                    # Fallback: dériver la place de cotation depuis le pays de l'ISIN
+                    # (même logique que le scraper Eurex)
+                    if not underlying_primary_exchange and underlying_isin and len(underlying_isin) >= 2:
+                        country = underlying_isin[:2]
+                        underlying_primary_exchange = _ISIN_COUNTRY_TO_IBKR_EXCHANGE.get(country, '')
                     
                     # Déterminer underlying_symbol : ticker > ISIN > jamais le nom
                     resolved_underlying = underlying_ticker or underlying_isin
